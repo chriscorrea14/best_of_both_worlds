@@ -5,6 +5,7 @@ from math import sqrt
 from sets import Set
 import argparse
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 class Env(object):
     __metaclass__ = ABCMeta
@@ -18,25 +19,19 @@ class Env(object):
         pass
 
 class StochasticEnv(Env):
-    def __init__(self, K, reward_sigma):
+    def __init__(self, K):
         Env.__init__(self, K)
-        self.reward_sigma = reward_sigma # each reward is normally distributed with parameters (arm_avgs[i], reward_sigma)
 
     def reward(self):
-        return np.clip(np.random.normal(loc=self.arm_avgs, scale=self.reward_sigma), 0, 1) 
-        # should we be calculating this ^ differently? 
+        return np.array([np.random.choice([0,1], p=[1-avg, avg]) for avg in self.arm_avgs])
 
 class AdversarialEnv(Env):
-    def __init__(self, K, p_adversarial, policy): 
+    def __init__(self, K, policy): 
         Env.__init__(K)
-        self.p_adversarial = p_adversarial # if 1, this is complete adversarial env, if 0, complete stochastic
         self.policy = policy # different adversaries for different policies
 
     def reward(self):
         raise NotImplementedError()
-
-
-
 
 class Policy(object):
     __metaclass__ = ABCMeta
@@ -54,7 +49,7 @@ class Policy(object):
 
     @abstractmethod
     def __str__(self):
-        pass
+        return 'General Policy'
 
 class RandomPolicy(Policy):
     def action(self):
@@ -71,7 +66,7 @@ class Exp3Policy(Policy):
         Policy.__init__(self, K)
         self.loss = np.zeros(K) # \tilde{L}_{i,t}
         self.learning_rate = sqrt(np.log(K) / (T * K)) # ?????
-        self.p = np.ones(K) / float(K)
+        self.p = np.ones(K) / K
 
     def action(self):
         exp = np.exp(-self.learning_rate * self.loss)
@@ -83,6 +78,39 @@ class Exp3Policy(Policy):
 
     def __str__(self):
         return 'Exp3 Policy'
+
+class Exp3ppPolicy(Policy):
+    def __init__(self, K, T):
+        Policy.__init__(self, K)
+        self.t = 0
+        self.deltas = np.zeros(K)
+        self.loss = np.zeros(K)
+        self.learning_rate = sqrt(np.log(K) / (T * K))
+        self.c = 18
+
+    def calculate_eps(self, delta):
+        beta = .5*sqrt(np.log(self.K)/(self.t*self.K))
+        xi = self.c * np.log(self.t)**2 / (self.t*delta**2)
+        return min(1/(2*self.K), beta, xi)
+
+    def calculate_p_tilde(self, p_i, eps_i, eps):
+        return (1-np.sum(eps))*p_i + eps_i
+
+    def action(self):
+        eps = np.array([self.calculate_eps(delta) for delta in self.deltas])
+        
+        exp = np.exp(-self.learning_rate * self.loss)
+        p = exp / np.sum(exp)
+        self.p_tilde = np.array([self.calculate_p_tilde(p_i, eps_i, eps) for p_i, eps_i in zip(p, eps)])
+        return np.random.choice(range(self.K), p=self.p_tilde)
+
+    def record_reward(self, action, reward):
+        self.loss[action] += (1 - reward) / self.p_tilde[action] # Is this correct ?????
+        self.deltas = (self.loss - np.min(self.loss)) / self.t
+        self.t += 1
+
+    def __str__(self):
+        return 'Exp3++ Policy'
 
 class BOBPolicy(Policy):
     def __init__(self, K):
@@ -119,7 +147,6 @@ class SAOPolicy(Policy):
             self.recent_action = self.exp3_policy.action()
         else:
             p = self.p / np.sum(self.p)
-            # print 'prob', p
             self.recent_action = np.random.choice(range(self.K), p=p)
         self.T[self.recent_action] += 1
         return self.recent_action
@@ -161,12 +188,9 @@ class SAOPolicy(Policy):
 
             if condition_18 or condition_19 or condition_20: # use Exp3.P
                 self.predicted_adversarial = True
-                print h_tilde, h_hat
                 print 'PREDICTED ADVERSARIAL.  CONDITIONS: ', condition_18, condition_19, condition_20
                 break
 
-            # print self.q[i]
-            # print self.A, self.B
             # Update Probabilities 
             if i in self.A:
                 self.q[i] = self.p[i]
@@ -180,38 +204,45 @@ class SAOPolicy(Policy):
         return 'SAO Policy'
 
 def run_bandit(policies, env, T):
-    total_reward = [0] * len(policies)
-    for _ in tqdm(range(T)):
+    total_reward = [0] * (len(policies) + 1)
+    cum_reward = [[] for _ in range(len(policies)+1)]
+    best_action = np.argmax(env.arm_avgs)
+    for j in tqdm(range(T)):
         reward = env.reward()
         for i, policy in enumerate(policies):
             action = policy.action()
             policy.record_reward(action, reward[action])
             total_reward[i] += reward[action]
+            cum_reward[i].append(total_reward[i])
+        total_reward[len(policies)] += reward[best_action]
+        cum_reward[len(policies)].append(total_reward[len(policies)])
 
-    best_in_hindsight = T*np.max(env.arm_avgs)
     print 'Arm Averages: {}\n'.format(env.arm_avgs)
     
-    for policy, reward in zip(policies, total_reward):
-        regret = best_in_hindsight - reward
+    for policy, reward in zip(policies, total_reward[:-1]):
+        regret = total_reward[-1] - reward
         print 'Policy: {}'.format(policy)
-        print 'Regret: {} - {} = {}\n'.format(best_in_hindsight, reward, regret)
-        # print 'Final Loss: {}\n'.format(policy.loss)
-        # print 'Regret is sublinear!' if regret / T < 1 else 'Regret is not sublinear :('
+        print 'Regret: {} - {} = {}\n'.format(total_reward[-1], reward, regret)
 
-    print 'g_tilde', policies[1].g_tilde / T
-    print 'p', policies[1].p
+    x = np.arange(0,T)
+    policies.append('Best In Hindsight')
+    for cum_rew, policy in zip(cum_reward, policies):
+        plt.plot(x, cum_rew, label=policy)
+
+    plt.legend()
+    plt.xlabel('Time')
+    plt.ylabel('Cumulative Reward')
+    plt.show()
 
 if __name__ == "__main__":
     # How to use: python main.py --T 1000000 --policy Random SAO
     # All arguments are optional
     parser = argparse.ArgumentParser()
-    parser.add_argument('--policy', '--list', default=['Exp3', 'SAO'], help='which policy to run')
+    parser.add_argument('--policy', '--list', default=['Random', 'Exp3', 'SAO'], help='which policy to run')
     parser.add_argument('--env', type=str, default='Sto', help='which env to use')
     parser.add_argument('--K', type=int, default=10, help='how many arms')
     parser.add_argument('--p_adversarial', type=float, default=1, help='probability env is adversarial')
     parser.add_argument('--T', type=int, default=100000, help='time horizon')
-    parser.add_argument('--reward_sigma', type=float, default=.1666, help='')
-        # I picked sigma kinda at random.  I said if mu=.5, 3 stddev should cover [0,1]
     args = parser.parse_args()
 
     policies = []
@@ -220,6 +251,8 @@ if __name__ == "__main__":
             policies.append(RandomPolicy(args.K))
         elif policy == 'Exp3':
             policies.append(Exp3Policy(args.K, args.T))
+        elif policy == 'Exp3pp':
+            policies.append(Exp3ppPolicy(args.K, args.T))
         elif policy == 'BOB':
             policies.append(BOBPolicy(args.K))
         elif policy == 'SAO':
@@ -228,7 +261,7 @@ if __name__ == "__main__":
             raise Exception('Policy {} not recognized'.format(policy))
 
     if args.env == 'Sto':
-        env = StochasticEnv(args.K, args.reward_sigma)
+        env = StochasticEnv(args.K)
     elif args.env == 'Adv':
         env = AdversarialEnv(args.K, args.p_adversarial, policy)
     else:
